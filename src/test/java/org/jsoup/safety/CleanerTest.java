@@ -701,4 +701,111 @@ public class CleanerTest {
         String input = "<style></t</style><img>";
         assertEquals("<style></t</style>", Jsoup.clean(input, policy));
     }
+
+    // Strict URL mode: Cleaner.cleanStrict
+
+    private static String strictClean(String html, String baseUri, Safelist safelist) {
+        Document clean = new Cleaner(safelist).cleanStrict(Jsoup.parse(html, baseUri));
+        return TextUtil.stripNewlines(clean.body().html());
+    }
+
+    private static Safelist srcsetSafelist() {
+        return Safelist.relaxed()
+            .addAttributes("img", "srcset")
+            .addProtocols("img", "srcset", "http", "https");
+    }
+
+    @Test void strictSrcsetKeepsSafeCandidates() {
+        String h = "<img srcset='/a.jpg 1x, /b.jpg 2x' alt=x>";
+        assertEquals("<img srcset=\"http://example.com/a.jpg 1x, http://example.com/b.jpg 2x\" alt=\"x\">",
+            strictClean(h, "http://example.com/", srcsetSafelist()));
+    }
+
+    @Test void strictSrcsetDropsWholeAttributeOnUnsafeCandidate() {
+        String h = "<img srcset='http://example.com/a.jpg 1x, javascript:alert(1) 2x' alt=x>";
+        assertEquals("<img alt=\"x\">", strictClean(h, "http://example.com/", srcsetSafelist()));
+    }
+
+    @Test void defaultCleanStillChecksSrcsetAsSingleValue() {
+        // the default clean() is unchanged: it resolves the whole srcset value as one URL, so the http: prefix passes
+        String h = "<img srcset='http://example.com/a.jpg 1x, javascript:alert(1) 2x'>";
+        String clean = Jsoup.clean(h, "http://example.com/", srcsetSafelist());
+        assertEquals("<img srcset=\"http://example.com/a.jpg 1x, javascript:alert(1) 2x\">", TextUtil.stripNewlines(clean));
+        // strict mode splits the candidates, sees the javascript: one, and drops the whole attribute
+        assertEquals("<img>", strictClean(h, "http://example.com/", srcsetSafelist()));
+    }
+
+    @Test void strictSchemeNormalization() {
+        Safelist basic = Safelist.basic();
+        // case, embedded control characters, and percent-encoding all resolve to the javascript scheme
+        assertEquals("<p><a rel=\"nofollow\">x</a></p>", strictClean("<p><a href='JaVaScRiPt:alert(1)'>x</a></p>", "", basic));
+        assertEquals("<p><a rel=\"nofollow\">x</a></p>", strictClean("<p><a href='java\tscript:alert(1)'>x</a></p>", "", basic));
+        assertEquals("<p><a rel=\"nofollow\">x</a></p>", strictClean("<p><a href='%6Aavascript:alert(1)'>x</a></p>", "", basic));
+        // a percent-encoded safe scheme is likewise recognized; the value itself is kept as-is
+        assertEquals("<p><a href=\"%68ttp://example.com/\" rel=\"nofollow\">x</a></p>", strictClean("<p><a href='%68ttp://example.com/'>x</a></p>", "", basic));
+        // leading / trailing whitespace and case don't evade or break a safe scheme (normalized on resolve)
+        assertEquals("<p><a href=\"http://nice.com\" rel=\"nofollow\">x</a></p>", strictClean("<p><a href='  HTTP://nice.com  '>x</a></p>", "", basic));
+    }
+
+    @Test void strictNamespacedAttributeUsesLocalNameProtocols() {
+        Safelist safelist = Safelist.none()
+            .addTags("svg", "use")
+            .addAttributes("use", "xlink:href")
+            .addProtocols("use", "href", "http", "https");
+        String h = "<svg><use xlink:href='javascript:alert(1)'></use><use xlink:href='http://example.com/i.svg#x'></use></svg>";
+        assertEquals("<svg><use></use><use xlink:href=\"http://example.com/i.svg#x\"></use></svg>",
+            strictClean(h, "", safelist));
+    }
+
+    @Test void strictPreservesRelativeLinks() {
+        Safelist safelist = srcsetSafelist().preserveRelativeLinks(true);
+        String h = "<img src='/a.png' srcset='/a.jpg 1x,  /b.jpg   2x'>";
+        // source text kept as-is, and the keep-original branch is stable on a second clean
+        String once = strictClean(h, "http://example.com/", safelist);
+        assertEquals("<img src=\"/a.png\" srcset=\"/a.jpg 1x,  /b.jpg   2x\">", once);
+        assertEquals(once, strictClean(once, "http://example.com/", safelist));
+    }
+
+    @Test void strictCleanIsIdempotent() {
+        String h = "<p><a href='/foo'>One</a><img src='/c.png' srcset='/a.jpg 1x, /b.jpg 2x'></p>";
+        String once = strictClean(h, "http://example.com/", srcsetSafelist());
+        assertEquals("<p><a href=\"http://example.com/foo\">One</a><img src=\"http://example.com/c.png\" srcset=\"http://example.com/a.jpg 1x, http://example.com/b.jpg 2x\"></p>", once);
+        assertEquals(once, strictClean(once, "http://example.com/", srcsetSafelist()));
+    }
+
+    @Test void strictSrcsetSplitAndRejoinStaysStable() {
+        // the comma in the source splits into three candidates; the rejoined value reparses to the same set
+        String h = "<img srcset='/a,b.jpg 1x, /c.jpg 2x'>";
+        String once = strictClean(h, "http://example.com/", srcsetSafelist());
+        assertEquals("<img srcset=\"http://example.com/a, http://example.com/b.jpg 1x, http://example.com/c.jpg 2x\">", once);
+        assertEquals(once, strictClean(once, "http://example.com/", srcsetSafelist()));
+    }
+
+    @Test void strictSrcsetCommaInResolvedUrlStaysStable() {
+        // a comma coming from the base URI path is encoded, so the rejoined value reparses to the same candidates
+        String h = "<img srcset='?q=1 1x, /c.jpg 2x'>";
+        String once = strictClean(h, "http://example.com/a,b/", srcsetSafelist());
+        assertEquals("<img srcset=\"http://example.com/a%2Cb/?q=1 1x, http://example.com/c.jpg 2x\">", once);
+        assertEquals(once, strictClean(once, "http://example.com/", srcsetSafelist()));
+    }
+
+    @Test void strictDropsUnresolvableRelativeUrls() {
+        // same as the default clean: a relative URL that can't be made absolute is dropped when not preserving relatives
+        assertEquals("<p><a rel=\"nofollow\">x</a></p>", strictClean("<p><a href='/foo'>x</a></p>", "", Safelist.basic()));
+        // anchors are OK when the # protocol is allowed
+        Safelist anchors = Safelist.basic().addProtocols("a", "href", "#");
+        assertEquals("<p><a href=\"#frag\" rel=\"nofollow\">x</a></p>", strictClean("<p><a href='#frag'>x</a></p>", "", anchors));
+    }
+
+    @Test void strictKeepsCustomProtocols() {
+        Safelist safelist = Safelist.basic().addProtocols("a", "href", "tel");
+        assertEquals("<p><a href=\"tel:123\" rel=\"nofollow\">x</a></p>", strictClean("<p><a href='tel:123'>x</a></p>", "", safelist));
+    }
+
+    @Test void strictCleanDoesNotModifyInput() {
+        Document dirty = Jsoup.parse("<p><a href='/foo'>One</a><img srcset='/a.jpg 1x, javascript:alert(1) 2x'></p>", "http://example.com/");
+        String before = dirty.html();
+        new Cleaner(srcsetSafelist()).cleanStrict(dirty);
+        assertEquals(before, dirty.html());
+    }
 }

@@ -12,6 +12,7 @@ import org.jsoup.nodes.Attribute;
 import org.jsoup.nodes.Attributes;
 import org.jsoup.nodes.Element;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -603,8 +604,54 @@ public class Safelist {
         return !tag.equals(AllTag) && shouldAbsUrl(AllTag, key);
     }
 
-    private static boolean isValidAnchor(String value) {
+    static boolean isValidAnchor(String value) {
         return value.startsWith("#") && !value.matches(".*\\s.*");
+    }
+
+    /**
+     Checks if the attribute is allowed on the tag, and if so, which URL protocols its value must match. Used by
+     {@link Cleaner#cleanStrict(org.jsoup.nodes.Document)}, which validates each URL candidate's scheme individually.
+     @return {@code null} if the attribute is not allowed; otherwise the protocols to enforce (empty if the
+     attribute's value is not URL restricted)
+     */
+    Set<Protocol> strictAttributeProtocols(String tagName, Attribute attr) {
+        return strictAttributeProtocols(TagName.valueOf(tagName), attr, true);
+    }
+
+    private Set<Protocol> strictAttributeProtocols(TagName tag, Attribute attr, boolean recurse) {
+        AttributeKey key = AttributeKey.valueOf(attr.getKey());
+
+        Set<AttributeKey> okSet = attributes.get(tag);
+        if (okSet != null && okSet.contains(key)) {
+            Set<Protocol> protocols = protocolsFor(tag, key);
+            return protocols != null ? protocols : Collections.emptySet();
+        }
+        Map<AttributeKey, AttributeValue> enforcedSet = enforcedAttributes.get(tag);
+        if (enforcedSet != null && enforcedSet.containsKey(key)
+            && enforcedSet.get(key).equals(AttributeValue.valueOf(attr.getValue()))) {
+            // enforced attr key was LCed via AttributeKey.valueOf(attr.getKey()),
+            // if the input already has that exact value, treat it as safe
+            return Collections.emptySet();
+        }
+        // no attributes defined for tag, try :all tag
+        return recurse ? strictAttributeProtocols(AllTag, attr, false) : null;
+    }
+
+    /**
+     Gets the protocols configured for the attribute on the tag. A namespaced attribute (e.g. {@code xlink:href})
+     falls back to the protocols of its local name ({@code href}) when it has none of its own.
+     */
+    private Set<Protocol> protocolsFor(TagName tag, AttributeKey key) {
+        Map<AttributeKey, Set<Protocol>> attrProts = protocols.get(tag);
+        if (attrProts == null) return null;
+        Set<Protocol> prots = attrProts.get(key);
+        if (prots == null) {
+            String name = key.toString();
+            int colon = name.indexOf(':');
+            if (colon > 0 && colon < name.length() - 1)
+                prots = attrProts.get(AttributeKey.valueOf(name.substring(colon + 1)));
+        }
+        return prots;
     }
 
     /**

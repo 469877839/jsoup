@@ -17,6 +17,7 @@ import org.jsoup.select.NodeVisitor;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.List;
+import java.util.Set;
 
 import static org.jsoup.internal.SharedConstants.DummyUri;
 
@@ -64,6 +65,39 @@ public class Cleaner {
 
         Document clean = Document.createShell(dirtyDocument.baseUri());
         copySafeNodes(dirtyDocument.body(), clean.body());
+        clean.outputSettings(dirtyDocument.outputSettings().clone());
+
+        return clean;
+    }
+
+    /**
+     Creates a new, clean document from the dirty document, like {@link #clean(Document)}, but with strict URL
+     validation. URL attributes (those with configured protocols) are checked per URL candidate: multi-candidate
+     attributes such as {@code srcset} are split into their individual URLs, and each candidate's scheme is parsed
+     and compared against the safelist's protocols. If any candidate is not allowed, the whole attribute is removed
+     (the element itself is kept). Scheme parsing normalizes case, and ignores leading and trailing whitespace,
+     ASCII control characters, and percent-encoding, so that e.g. {@code "JaVaScript:..."} and
+     {@code "%6Aavascript:..."} are both seen as the {@code javascript} scheme. A namespaced attribute (e.g.
+     {@code xlink:href}) is checked against the protocols of its local name ({@code href}) when it has no protocols
+     of its own.
+     <p>
+     As in {@link #clean(Document)}, relative URLs are made absolute unless
+     {@link Safelist#preserveRelativeLinks(boolean)} is set, in which case the source text is kept as-is. The
+     written attribute values are stable: cleaning the output of this method produces byte-identical output.
+     </p>
+     <p>
+     The input document is not modified. Only elements from the dirty document's <code>body</code> are used. The
+     OutputSettings of the original document are cloned into the clean document.
+     </p>
+     @param dirtyDocument Untrusted base document to clean.
+     @return cleaned document.
+     */
+    public Document cleanStrict(Document dirtyDocument) {
+        Validate.notNull(dirtyDocument);
+
+        Document clean = Document.createShell(dirtyDocument.baseUri());
+        CleaningVisitor cleaningVisitor = new CleaningVisitor(dirtyDocument.body(), clean.body(), new UrlAttributeChecker(safelist));
+        cleaningVisitor.traverse(dirtyDocument.body());
         clean.outputSettings(dirtyDocument.outputSettings().clone());
 
         return clean;
@@ -139,10 +173,16 @@ public class Cleaner {
         private int numDiscarded = 0;
         private final Element root;
         private Element destination; // current element to append nodes to
+        private final UrlAttributeChecker urlChecker; // set in strict mode; null for the default clean
 
         private CleaningVisitor(Element root, Element destination) {
+            this(root, destination, null);
+        }
+
+        private CleaningVisitor(Element root, Element destination, UrlAttributeChecker urlChecker) {
             this.root = root;
             this.destination = destination;
+            this.urlChecker = urlChecker;
         }
 
         @Override public void head(Node source, int depth) {
@@ -150,7 +190,7 @@ public class Cleaner {
                 Element sourceEl = (Element) source;
 
                 if (safelist.isSafeTag(sourceEl.normalName())) { // safe, clone and copy safe attrs
-                    ElementMeta meta = createSafeElement(sourceEl);
+                    ElementMeta meta = urlChecker == null ? createSafeElement(sourceEl) : createSafeElementStrict(sourceEl, urlChecker);
                     Element destChild = meta.el;
                     destination.appendChild(destChild);
 
@@ -210,6 +250,49 @@ public class Cleaner {
                 numDiscarded++;
         }
 
+        applyEnforcedAttributes(sourceEl, sourceTag, destAttrs);
+        dest.attributes().addAll(destAttrs); // re-attach, if removed in clear
+        return new ElementMeta(dest, numDiscarded);
+    }
+
+    /**
+     Like {@link #createSafeElement(Element)}, but validates URL attributes per candidate via the
+     {@link UrlAttributeChecker}, and never writes back into the source element.
+     */
+    private ElementMeta createSafeElementStrict(Element sourceEl, UrlAttributeChecker urlChecker) {
+        Element dest = sourceEl.shallowClone(); // reuses tag, clones attributes and preserves any user data
+        String sourceTag = sourceEl.tagName();
+        Attributes destAttrs = dest.attributes();
+        dest.clearAttributes(); // clear all non-internal attributes, ready for safe copy
+
+        int numDiscarded = 0;
+        Attributes sourceAttrs = sourceEl.attributes();
+        for (Attribute sourceAttr : sourceAttrs) {
+            Set<Safelist.Protocol> protocols = safelist.strictAttributeProtocols(sourceTag, sourceAttr);
+            if (protocols == null) { // attribute not allowed
+                numDiscarded++;
+                continue;
+            }
+            String key = sourceAttr.getKey();
+            String value = sourceAttr.getValue();
+            if (!protocols.isEmpty()) { // URL attribute; check each candidate's scheme
+                value = urlChecker.check(sourceTag, sourceEl, key, value, protocols);
+                if (value == null) { // a candidate was not safe; drop the whole attribute
+                    numDiscarded++;
+                    continue;
+                }
+            }
+            Range.AttributeRange range = sourceAttrs.sourceRange(key);
+            destAttrs.put(key, value);
+            NodeInternals.attributeRange(destAttrs, key, range);
+        }
+
+        applyEnforcedAttributes(sourceEl, sourceTag, destAttrs);
+        dest.attributes().addAll(destAttrs); // re-attach, if removed in clear
+        return new ElementMeta(dest, numDiscarded);
+    }
+
+    private void applyEnforcedAttributes(Element sourceEl, String sourceTag, Attributes destAttrs) {
         Attributes enforcedAttrs = safelist.getEnforcedAttributes(sourceTag);
         // special case for <a href rel=nofollow>, only apply to external links:
         if (sourceEl.nameIs("a") && enforcedAttrs.get("rel").equals("nofollow")) {
@@ -230,8 +313,6 @@ public class Cleaner {
             destAttrs.removeIgnoreCase(enforcedAttr.getKey());
             destAttrs.put(enforcedAttr.getKey(), enforcedAttr.getValue());
         }
-        dest.attributes().addAll(destAttrs); // re-attach, if removed in clear
-        return new ElementMeta(dest, numDiscarded);
     }
 
     private static class ElementMeta {
