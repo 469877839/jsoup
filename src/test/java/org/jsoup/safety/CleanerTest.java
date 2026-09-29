@@ -701,4 +701,113 @@ public class CleanerTest {
         String input = "<style></t</style><img>";
         assertEquals("<style></t</style>", Jsoup.clean(input, policy));
     }
+
+    private static String cleanStable(String html, String baseUri, Safelist safelist) {
+        Document dirty = Jsoup.parseBodyFragment(html, baseUri);
+        return new Cleaner(safelist).clean(dirty, Cleaner.Mode.Stable).body().html();
+    }
+
+    private static Safelist srcsetSafelist() {
+        return Safelist.relaxed()
+            .addAttributes("img", "srcset")
+            .addProtocols("img", "srcset", "http", "https");
+    }
+
+    @Test void stableModeDropsSrcsetWithUnsafeCandidate() {
+        // one bad candidate drops the whole attribute; the element is kept
+        String html = "<img srcset='https://example.com/a.png 1x, javascript:alert(1) 2x' alt=x>";
+        assertEquals("<img alt=\"x\">", cleanStable(html, "https://example.com/", srcsetSafelist()));
+    }
+
+    @Test void stableModeKeepsSafeSrcset() {
+        String html = "<img srcset='a.png 1x, https://example.com/b.png 2x'>";
+        assertEquals("<img srcset=\"https://example.com/a.png 1x, https://example.com/b.png 2x\">",
+            cleanStable(html, "https://example.com/", srcsetSafelist()));
+    }
+
+    @Test void stableModeSrcsetDataUriWithComma() {
+        Safelist safelist = Safelist.relaxed()
+            .addAttributes("img", "srcset")
+            .addProtocols("img", "srcset", "http", "https", "data");
+        String html = "<img srcset='data:image/png;base64,iVBORw0KGgo= 1x, b.png 2x'>";
+        String once = cleanStable(html, "https://example.com/", safelist);
+        assertEquals("<img srcset=\"data:image/png;base64,iVBORw0KGgo= 1x, https://example.com/b.png 2x\">", once);
+        assertEquals(once, cleanStable(once, "https://example.com/", safelist));
+    }
+
+    @Test void stableModeSrcsetTrailingCommaEndsCandidate() {
+        // a URL token ending in a comma ends the candidate; the next token is a new candidate, not a descriptor
+        String html = "<img srcset='https://example.com/a.png, javascript:alert(1) 2x'>";
+        assertEquals("<img>", cleanStable(html, "https://example.com/", srcsetSafelist()));
+    }
+
+    @Test void stableModeSrcsetDescriptorlessCandidateIsStable() {
+        String base = "https://example.com/";
+        Safelist safelist = srcsetSafelist();
+        String once = cleanStable("<img srcset='a.png, b.png 2x'>", base, safelist);
+        assertEquals("<img srcset=\"https://example.com/a.png, https://example.com/b.png 2x\">", once);
+        assertEquals(once, cleanStable(once, base, safelist));
+    }
+
+    @Test void stableModeIsIdempotent() {
+        String html = "<a href='/foo'>Link</a><img src='bar.png' srcset='a.png 1x, /b.png 2x'>";
+        String base = "https://example.com/";
+        Safelist safelist = srcsetSafelist();
+        String once = cleanStable(html, base, safelist);
+        assertEquals("<a href=\"https://example.com/foo\">Link</a>"
+            + "<img src=\"https://example.com/bar.png\" srcset=\"https://example.com/a.png 1x, https://example.com/b.png 2x\">", once);
+        assertEquals(once, cleanStable(once, base, safelist));
+    }
+
+    @Test void stableModePreserveRelativeLinksKeepsSourceValue() {
+        Safelist safelist = srcsetSafelist().preserveRelativeLinks(true);
+        String html = "<a href='/foo'>One</a><img srcset='a.png  1x,   /b.png 2x'>";
+        String base = "https://example.com/";
+        String once = cleanStable(html, base, safelist);
+        assertEquals("<a href=\"/foo\">One</a><img srcset=\"a.png  1x,   /b.png 2x\">", once);
+        assertEquals(once, cleanStable(once, base, safelist));
+    }
+
+    @Test void stableModeChecksParsedScheme() {
+        Safelist safelist = Safelist.relaxed();
+        String base = "https://example.com/";
+        // scheme case and surrounding whitespace do not affect the check
+        assertEquals("<a href=\"HTTP://example.com/\">x</a>", cleanStable("<a href=' HTTP://example.com/ '>x</a>", base, safelist));
+        // control characters are stripped before the scheme is parsed
+        assertEquals("<a>x</a>", cleanStable("<a href=\"ja&Tab;vascript:alert(1)\">x</a>", base, safelist));
+        // a percent-encoded scheme is not a parsed scheme; the value is treated as a relative URL
+        assertEquals("<a href=\"https://example.com/%6aavascript:alert(1)\">x</a>",
+            cleanStable("<a href='%6aavascript:alert(1)'>x</a>", base, safelist));
+    }
+
+    @Test void stableModeNamespacedAttributeFollowsLocalNameRules() {
+        Safelist safelist = Safelist.none()
+            .addTags("svg", "a")
+            .addAttributes("a", "href")
+            .addProtocols("a", "href", "http", "https");
+        String html = "<svg><a xlink:href='javascript:alert(1)'>Bad</a><a xlink:href='https://example.com/'>Good</a></svg>";
+        assertEquals("<svg><a>Bad</a><a xlink:href=\"https://example.com/\">Good</a></svg>",
+            TextUtil.stripNewlines(cleanStable(html, "https://example.com/", safelist)));
+    }
+
+    @Test void stableModeAnchorProtocol() {
+        Safelist safelist = Safelist.relaxed().addProtocols("a", "href", "#");
+        String html = "<a href='#frag'>One</a><a href='#bad frag'>Two</a>";
+        assertEquals("<a href=\"#frag\">One</a><a>Two</a>", cleanStable(html, "https://example.com/", safelist));
+    }
+
+    @Test void stableModeDropsUnresolvableRelativeLinks() {
+        assertEquals("<a rel=\"nofollow\">Link</a>", cleanStable("<a href='/foo'>Link</a>", "", Safelist.basic()));
+    }
+
+    @Test void stableModeDropsEmptyUrlAttribute() {
+        assertEquals("<img alt=\"\">", cleanStable("<img alt='' src=''>", "https://example.com/", Safelist.basicWithImages()));
+    }
+
+    @Test void stableModeDoesNotModifyInputDocument() {
+        Document dirty = Jsoup.parseBodyFragment("<a href='/foo'>Link</a>", "http://example.com/");
+        Document clean = new Cleaner(Safelist.basic()).clean(dirty, Cleaner.Mode.Stable);
+        assertEquals("<a href=\"http://example.com/foo\">Link</a>", clean.body().html());
+        assertEquals("/foo", dirty.expectFirst("a").attr("href"));
+    }
 }

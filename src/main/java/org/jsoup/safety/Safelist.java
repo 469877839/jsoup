@@ -11,6 +11,7 @@ import org.jsoup.internal.StringUtil;
 import org.jsoup.nodes.Attribute;
 import org.jsoup.nodes.Attributes;
 import org.jsoup.nodes.Element;
+import org.jspecify.annotations.Nullable;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -603,8 +604,63 @@ public class Safelist {
         return !tag.equals(AllTag) && shouldAbsUrl(AllTag, key);
     }
 
-    private static boolean isValidAnchor(String value) {
+    static boolean isValidAnchor(String value) {
         return value.startsWith("#") && !value.matches(".*\\s.*");
+    }
+
+    /**
+     The result of checking an attribute against this safelist in {@link Cleaner.Mode#Stable} mode: if the attribute
+     is allowed, and if so, the URL protocols that each URL candidate in its value must use (when URL-restricted).
+     */
+    static final class AttributeCheck {
+        static final AttributeCheck NotAllowed = new AttributeCheck(false, null);
+        static final AttributeCheck Allowed = new AttributeCheck(true, null); // allowed, with no URL restriction
+
+        final boolean allowed;
+        final @Nullable Set<String> protocols; // lowercase protocols that URL candidates in the value must use
+
+        private AttributeCheck(boolean allowed, @Nullable Set<String> protocols) {
+            this.allowed = allowed;
+            this.protocols = protocols;
+        }
+
+        private static AttributeCheck checkUrls(Set<Protocol> protocols) {
+            Set<String> protSet = new HashSet<>(protocols.size());
+            for (Protocol protocol : protocols)
+                protSet.add(lowerCase(protocol.toString()));
+            return new AttributeCheck(true, protSet);
+        }
+    }
+
+    /**
+     Stable-mode attribute check, used by {@link Cleaner.Mode#Stable}. Follows the same tag and attribute allowance
+     rules as {@link #isSafeAttribute}, but does not test the attribute value itself; instead, when the attribute is
+     URL-restricted, the configured protocols are returned for the caller to validate each URL candidate in the value
+     against. Namespaced attributes (e.g. {@code xlink:href}) follow the rules configured for their local name
+     (e.g. {@code href}).
+     */
+    AttributeCheck attributeCheck(String tagName, Attribute attr) {
+        TagName tag = TagName.valueOf(tagName);
+        AttributeKey key = AttributeKey.valueOf(attr.getKey());
+        AttributeKey localKey = AttributeKey.valueOf(attr.localName());
+
+        Set<AttributeKey> okSet = attributes.get(tag);
+        if (okSet != null && (okSet.contains(key) || okSet.contains(localKey))) {
+            Map<AttributeKey, Set<Protocol>> attrProts = protocols.get(tag);
+            if (attrProts == null) return AttributeCheck.Allowed;
+            Set<Protocol> prots = attrProts.get(key);
+            if (prots == null) prots = attrProts.get(localKey);
+            return prots == null ? AttributeCheck.Allowed : AttributeCheck.checkUrls(prots);
+        }
+        Map<AttributeKey, AttributeValue> enforcedSet = enforcedAttributes.get(tag);
+        if (enforcedSet != null && enforcedSet.containsKey(key)) {
+            // enforced attr key was LCed via AttributeKey.valueOf(attr.getKey()),
+            // if the input already has that exact value, treat it as safe
+            return enforcedSet.get(key).equals(AttributeValue.valueOf(attr.getValue()))
+                ? AttributeCheck.Allowed : AttributeCheck.NotAllowed;
+        }
+        // no attributes defined for tag, try :all tag
+        return tagName.equals(All) ? AttributeCheck.NotAllowed : attributeCheck(All, attr);
     }
 
     /**

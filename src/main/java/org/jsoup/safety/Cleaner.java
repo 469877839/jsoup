@@ -13,6 +13,7 @@ import org.jsoup.nodes.TextNode;
 import org.jsoup.parser.ParseErrorList;
 import org.jsoup.parser.Parser;
 import org.jsoup.select.NodeVisitor;
+import org.jspecify.annotations.Nullable;
 
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -53,6 +54,24 @@ public class Cleaner {
     }
 
     /**
+     Cleaning modes for {@link #clean(Document, Mode)}.
+     */
+    public enum Mode {
+        /**
+         The default cleaning behavior. A URL attribute's whole value is resolved to an absolute URL and tested
+         against the safelist's allowed protocol prefixes.
+         */
+        Default,
+        /**
+         Stable cleaning behavior. A URL attribute's value is split into individual URL candidates (e.g. each
+         {@code srcset} candidate); each candidate's parsed scheme is checked against the safelist's allowed
+         protocols, and if any candidate is not allowed, the whole attribute is removed (the element is kept).
+         Cleaning a document again with this mode produces output identical to the first clean.
+         */
+        Stable
+    }
+
+    /**
      Creates a new, clean document, from the original dirty document, containing only elements allowed by the safelist.
      The original document is not modified. Only elements from the dirty document's <code>body</code> are used. The
      OutputSettings of the original document are cloned into the clean document.
@@ -60,10 +79,24 @@ public class Cleaner {
      @return cleaned document.
      */
     public Document clean(Document dirtyDocument) {
+        return clean(dirtyDocument, Mode.Default);
+    }
+
+    /**
+     Creates a new, clean document, from the original dirty document, containing only elements allowed by the
+     safelist, using the supplied cleaning mode. The original document is not modified. Only elements from the dirty
+     document's <code>body</code> are used. The OutputSettings of the original document are cloned into the clean
+     document.
+     @param dirtyDocument Untrusted base document to clean.
+     @param mode cleaning mode to apply; see {@link Mode}
+     @return cleaned document.
+     */
+    public Document clean(Document dirtyDocument, Mode mode) {
         Validate.notNull(dirtyDocument);
+        Validate.notNull(mode);
 
         Document clean = Document.createShell(dirtyDocument.baseUri());
-        copySafeNodes(dirtyDocument.body(), clean.body());
+        copySafeNodes(dirtyDocument.body(), clean.body(), mode);
         clean.outputSettings(dirtyDocument.outputSettings().clone());
 
         return clean;
@@ -138,11 +171,13 @@ public class Cleaner {
     private final class CleaningVisitor implements NodeVisitor {
         private int numDiscarded = 0;
         private final Element root;
+        private final @Nullable UrlAttributeChecker urlChecker;
         private Element destination; // current element to append nodes to
 
-        private CleaningVisitor(Element root, Element destination) {
+        private CleaningVisitor(Element root, Element destination, @Nullable UrlAttributeChecker urlChecker) {
             this.root = root;
             this.destination = destination;
+            this.urlChecker = urlChecker;
         }
 
         @Override public void head(Node source, int depth) {
@@ -150,7 +185,7 @@ public class Cleaner {
                 Element sourceEl = (Element) source;
 
                 if (safelist.isSafeTag(sourceEl.normalName())) { // safe, clone and copy safe attrs
-                    ElementMeta meta = createSafeElement(sourceEl);
+                    ElementMeta meta = createSafeElement(sourceEl, urlChecker);
                     Element destChild = meta.el;
                     destination.appendChild(destChild);
 
@@ -180,12 +215,17 @@ public class Cleaner {
     }
 
     private int copySafeNodes(Element source, Element dest) {
-        CleaningVisitor cleaningVisitor = new CleaningVisitor(source, dest);
+        return copySafeNodes(source, dest, Mode.Default);
+    }
+
+    private int copySafeNodes(Element source, Element dest, Mode mode) {
+        UrlAttributeChecker urlChecker = mode == Mode.Stable ? new UrlAttributeChecker(source.baseUri()) : null;
+        CleaningVisitor cleaningVisitor = new CleaningVisitor(source, dest, urlChecker);
         cleaningVisitor.traverse(source);
         return cleaningVisitor.numDiscarded;
     }
 
-    private ElementMeta createSafeElement(Element sourceEl) {
+    private ElementMeta createSafeElement(Element sourceEl, @Nullable UrlAttributeChecker urlChecker) {
         Element dest = sourceEl.shallowClone(); // reuses tag, clones attributes and preserves any user data
         String sourceTag = sourceEl.tagName();
         Attributes destAttrs = dest.attributes();
@@ -194,20 +234,38 @@ public class Cleaner {
         int numDiscarded = 0;
         Attributes sourceAttrs = sourceEl.attributes();
         for (Attribute sourceAttr : sourceAttrs) {
-            if (safelist.isSafeAttribute(sourceTag, sourceEl, sourceAttr)) { // will keep this attr
-                String key = sourceAttr.getKey();
-                String value = sourceAttr.getValue();
-
+            String key = sourceAttr.getKey();
+            String value;
+            if (urlChecker == null) { // default mode: test the whole attribute value
+                if (!safelist.isSafeAttribute(sourceTag, sourceEl, sourceAttr)) {
+                    numDiscarded++;
+                    continue;
+                }
+                value = sourceAttr.getValue();
                 if (safelist.shouldAbsUrl(sourceTag, key)) { // configured to make absolute urls for this key (href)
                     value = sourceEl.absUrl(key);
                     if (value.isEmpty()) // could not be made abs; leave as-is to allow custom unknown protocols
                         value = sourceAttr.getValue();
                 }
-                Range.AttributeRange range = sourceAttrs.sourceRange(key);
-                destAttrs.put(key, value);
-                NodeInternals.attributeRange(destAttrs, key, range);
-            } else
-                numDiscarded++;
+            } else { // stable mode: test each URL candidate in the value
+                Safelist.AttributeCheck check = safelist.attributeCheck(sourceTag, sourceAttr);
+                if (!check.allowed) {
+                    numDiscarded++;
+                    continue;
+                }
+                value = sourceAttr.getValue();
+                if (check.protocols != null) { // URL-restricted attribute
+                    if (!urlChecker.isSafeValue(sourceAttr, check.protocols)) {
+                        numDiscarded++;
+                        continue;
+                    }
+                    if (!safelist.preserveRelativeLinks()) // make relative URLs absolute; else keep the source value
+                        value = urlChecker.absolutize(sourceAttr);
+                }
+            }
+            Range.AttributeRange range = sourceAttrs.sourceRange(key);
+            destAttrs.put(key, value);
+            NodeInternals.attributeRange(destAttrs, key, range);
         }
 
         Attributes enforcedAttrs = safelist.getEnforcedAttributes(sourceTag);
